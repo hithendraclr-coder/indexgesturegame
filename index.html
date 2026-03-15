@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gesture Subway Surfers</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; font-family: sans-serif; }
+        canvas { display: block; }
+        #ui { position: absolute; top: 20px; left: 20px; color: white; text-shadow: 2px 2px 4px rgba(0,0,0,0.5); z-index: 10; }
+        #video-container { position: absolute; bottom: 10px; right: 10px; width: 160px; height: 120px; border: 2px solid white; border-radius: 8px; overflow: hidden; z-index: 10; transform: scaleX(-1); }
+        #video { width: 100%; height: 100%; object-fit: cover; }
+        #status { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: white; font-size: 24px; pointer-events: none; }
+    </style>
+</head>
+<body>
+    <div id="ui">
+        <h1>SURFER JS</h1>
+        <p>Score: <span id="score">0</span></p>
+        <p>Action: <span id="gesture">Detecting...</span></p>
+    </div>
+    <div id="status">Loading AI Models...</div>
+    <div id="video-container"><video id="video" autoplay playsinline></video></div>
+
+    <!-- Libraries -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+
+    <script>
+        /** GAME CONSTANTS **/
+        const LANES = [-3, 0, 3];
+        const PLAYER_SPEED = 0.2;
+        const JUMP_FORCE = 0.15;
+        const GRAVITY = 0.008;
+
+        /** THREE.JS SETUP **/
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x87ceeb);
+        scene.fog = new THREE.Fog(0x87ceeb, 20, 100);
+
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+        scene.add(ambientLight);
+        const sunLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        sunLight.position.set(5, 10, 5);
+        scene.add(sunLight);
+
+        // Ground (Track)
+        const groundGeo = new THREE.PlaneGeometry(10, 1000);
+        const groundMat = new THREE.MeshPhongMaterial({ color: 0x333333 });
+        const ground = new THREE.Mesh(groundGeo, groundMat);
+        ground.rotation.x = -Math.PI / 2;
+        scene.add(ground);
+
+        // Player (The "Boy")
+        const playerGeo = new THREE.BoxGeometry(1, 1.8, 1);
+        const playerMat = new THREE.MeshPhongMaterial({ color: 0xff4444 });
+        const player = new THREE.Mesh(playerGeo, playerMat);
+        player.position.set(0, 0.9, 0);
+        scene.add(player);
+
+        /** PARTICLE SYSTEM (Trail Effect) **/
+        const particleCount = 20;
+        const particles = new THREE.Group();
+        const pGeo = new THREE.SphereGeometry(0.1, 8, 8);
+        const pMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true });
+        for(let i=0; i<particleCount; i++) {
+            const p = new THREE.Mesh(pGeo, pMat.clone());
+            p.visible = false;
+            particles.add(p);
+        }
+        scene.add(particles);
+
+        let pIdx = 0;
+        function emitParticle() {
+            const p = particles.children[pIdx];
+            p.visible = true;
+            p.position.set(player.position.x + (Math.random()-0.5), 0.1, player.position.z);
+            p.material.opacity = 1;
+            pIdx = (pIdx + 1) % particleCount;
+        }
+
+        /** OBSTACLES **/
+        const obstacles = [];
+        function createObstacle() {
+            const type = Math.random() > 0.5 ? 'train' : 'barrier';
+            const lane = LANES[Math.floor(Math.random() * 3)];
+            let geo, mat, y;
+            
+            if(type === 'train') {
+                geo = new THREE.BoxGeometry(2, 3, 6);
+                mat = new THREE.MeshPhongMaterial({ color: 0x5555ff });
+                y = 1.5;
+            } else {
+                geo = new THREE.BoxGeometry(2.5, 0.8, 0.5);
+                mat = new THREE.MeshPhongMaterial({ color: 0xffff00 });
+                y = 0.4;
+            }
+
+            const mesh = new THREE.Mesh(geo, mat);
+            mesh.position.set(lane, y, -60);
+            scene.add(mesh);
+            obstacles.push(mesh);
+        }
+
+        /** HAND TRACKING LOGIC **/
+        let currentLane = 1; // 0, 1, 2
+        let vY = 0;
+        let isGrounded = true;
+        let score = 0;
+        let isCrouching = false;
+
+        const videoElement = document.getElementById('video');
+        const gestureText = document.getElementById('gesture');
+
+        const hands = new Hands({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+        });
+
+        hands.setOptions({
+            maxNumHands: 1,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+
+        hands.onResults((results) => {
+            document.getElementById('status').style.display = 'none';
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                const landmarks = results.multiHandLandmarks[0];
+                const indexTip = landmarks[8];
+                const indexBase = landmarks[5];
+                const wrist = landmarks[0];
+
+                // LANE CONTROL (Horizontal position of index tip)
+                if (indexTip.x > 0.65) currentLane = 0;
+                else if (indexTip.x < 0.35) currentLane = 2;
+                else currentLane = 1;
+
+                // ACTION CONTROL (Vertical relative to index base)
+                const dy = indexTip.y - indexBase.y;
+                if (dy < -0.1) { // Pointing Up
+                    if(isGrounded) vY = JUMP_FORCE;
+                    gestureText.innerText = "JUMP";
+                } else if (dy > 0.05) { // Pointing Down
+                    isCrouching = true;
+                    gestureText.innerText = "CROUCH";
+                } else {
+                    isCrouching = false;
+                    gestureText.innerText = "RUNNING";
+                }
+            }
+        });
+
+        const cameraUtils = new Camera(videoElement, {
+            onFrame: async () => { await hands.send({ image: videoElement }); },
+            width: 640, height: 480
+        });
+        cameraUtils.start();
+
+        /** GAME LOOP **/
+        camera.position.set(0, 5, 10);
+        camera.lookAt(0, 0, -5);
+
+        function update() {
+            // Player movement
+            const targetX = LANES[currentLane];
+            player.position.x += (targetX - player.position.x) * 0.15;
+
+            // Jump Physics
+            player.position.y += vY;
+            if (player.position.y > 0.9) {
+                vY -= GRAVITY;
+                isGrounded = false;
+            } else {
+                player.position.y = 0.9;
+                vY = 0;
+                isGrounded = true;
+            }
+
+            // Crouch Scaling
+            if (isCrouching) {
+                player.scale.y = 0.5;
+                player.position.y = 0.45;
+            } else if (isGrounded) {
+                player.scale.y = 1;
+            }
+
+            // Particles
+            if(isGrounded && Math.random() > 0.7) emitParticle();
+            particles.children.forEach(p => {
+                if(p.visible) {
+                    p.position.z += 0.5;
+                    p.material.opacity -= 0.05;
+                    if(p.material.opacity <= 0) p.visible = false;
+                }
+            });
+
+            // Obstacles logic
+            if (Math.random() < 0.02) createObstacle();
+            for (let i = obstacles.length - 1; i >= 0; i--) {
+                const obs = obstacles[i];
+                obs.position.z += 0.4;
+
+                // Collision Check
+                const distZ = Math.abs(player.position.z - obs.position.z);
+                const distX = Math.abs(player.position.x - obs.position.x);
+                if (distZ < 1 && distX < 1) {
+                    // Simple check for jump/crouch height
+                    const isTrain = obs.geometry.parameters.height > 1;
+                    if (isTrain && player.position.y < 2.5) {
+                        score = 0; // Reset on hit
+                    } else if (!isTrain && !isCrouching) {
+                        score = 0;
+                    }
+                }
+
+                if (obs.position.z > 10) {
+                    scene.remove(obs);
+                    obstacles.splice(i, 1);
+                    score++;
+                }
+            }
+
+            document.getElementById('score').innerText = score;
+            renderer.render(scene, camera);
+            requestAnimationFrame(update);
+        }
+
+        update();
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>
